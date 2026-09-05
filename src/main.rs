@@ -20,7 +20,7 @@ const BLOCK_SIZE: usize = 4096; // Kb
 const BLOCK_GROUP_SIZE: usize = 128*(1 << 20); // Mb
 const BLOCKS_PER_GROUP: usize = BLOCK_GROUP_SIZE/BLOCK_SIZE;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct SuperBlock {
     magic: [u8; 5],
     nr_inodes: u32,
@@ -28,31 +28,18 @@ struct SuperBlock {
     nr_tags: u32,
 }
 
+#[derive(Debug)]
 struct TagFs {
     sup_block: SuperBlock,
     dev: File
 }
 
-impl TagFs {
-    fn load_device(dev_name: &str, enable_trunc: bool) -> File {
-        let open = File::options()
-            .read(true)
-            .write(true)
-            .truncate(enable_trunc)
-            .open(dev_name);
-
-        if open.is_err() {
-            panic!("something went wrong: {}", open.err().unwrap());
-        }
-
-        open.unwrap()
-    }
-
-    fn _save_superblock(fd: &mut File, sup_block: &SuperBlock) -> Result<()> {
+impl SuperBlock {
+    pub fn save(&self, fd: &mut File) -> Result<()> {
         
         let space_left: usize = BLOCK_SIZE - BOOT_SECTOR_SIZE; 
 
-        let res_encoded = bincode::serialize(sup_block).map_err(|e| {
+        let res_encoded = bincode::serialize(self).map_err(|e| {
             Error::new(ErrorKind::InvalidData,e);
         });
 
@@ -76,9 +63,37 @@ impl TagFs {
         let mut block_buffer = vec![0u8; space_left];
         block_buffer[..encoded.len()].copy_from_slice(&encoded);
         fd.write_all(&block_buffer)?;
+        fd.flush()?;
 
         Ok(())
     }
+
+    pub fn read(fd: &mut File) -> Result<Self> {
+        let sup_size: usize = BLOCK_SIZE - BOOT_SECTOR_SIZE;
+
+        let mut tmp_buff: Vec<u8> =  vec![0u8; sup_size];
+        fd.read_exact(&mut tmp_buff)?;
+
+        bincode::deserialize(&tmp_buff).map_err(Error::other)
+    }
+}
+
+impl TagFs {
+
+    fn load_device(dev_name: &str, enable_trunc: bool) -> File {
+        let open = File::options()
+            .read(true)
+            .write(true)
+            .truncate(enable_trunc)
+            .open(dev_name);
+
+        if open.is_err() {
+            panic!("something went wrong: {}", open.err().unwrap());
+        }
+
+        open.unwrap()
+    }
+
 
     pub fn format(dev_name: &str) -> Result<()> {
         let mut fd = Self::load_device(dev_name, true);
@@ -97,8 +112,7 @@ impl TagFs {
         fd.write_all(&[0u8; 1024])?; // padding for boot sector
 
         // write superblock
-        Self::_save_superblock(&mut fd, &sup_block)?;
-
+        sup_block.save(&mut fd)?;
 
         // Pad the rest of Block 0 with zeros
         let current_pos = fd.stream_position()? as usize;
@@ -108,14 +122,7 @@ impl TagFs {
         Ok(())
     }
 
-    fn check_magic(device: &mut File) -> bool {
-        let mut fs_magic: [u8; 5] = [0u8; 5];
-        let read_res = device.read_exact(&mut fs_magic);
-        if read_res.is_err() {
-            return false;
-        }
-        &fs_magic == MAGIC
-    }
+    fn check_magic(magic_in: &[u8;5]) -> bool { magic_in == MAGIC }
 
     fn _access_block(&mut self, block_index: usize, offset: u16) -> Result<()> {
         if block_index < 1 {
@@ -155,43 +162,25 @@ impl TagFs {
         res
     }
 
-    fn mount(dev_name: &str) -> Self {
+    fn mount(dev_name: &str) -> Result<Self> {
         let mut device = Self::load_device(dev_name, false);
         let mut boot_tmp: [u8;1024] = [0u8;1024]; 
 
-        let boot_read = device.read_exact(&mut boot_tmp);
-        if boot_read.is_err(){
-            let boot_err = boot_read.err().unwrap();
-            panic!("Failed to read boot sector: {}", boot_err);
+        let _ = device.read_exact(&mut boot_tmp)?;
+        let sup_block = SuperBlock::read(&mut device)?;
+
+        if !Self::check_magic(&sup_block.magic) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Filesystem magic number did not match"));
         }
 
-        if !Self::check_magic(&mut device) {
-            panic!("Filesystem magic number did not match");
-        }
-
-        let mut read_buff: [u8; 8] = [0u8; 8];
-        let size_read = device.read_exact(&mut read_buff);
-
-        if size_read.is_err() {
-            panic!(
-                "Cannot be able to read size of the filesystem: {}",
-                size_read.err().unwrap()
-            );
-        }
-
-        let read_res: u64 = u64::from_le_bytes(read_buff);
-
-        let sup_block: SuperBlock = SuperBlock {
-            magic: *MAGIC,
-            nr_inodes: 0,
-            nr_blocks: 0,
-            nr_tags: 0
-        };
-
-        Self {
+        let res_ok = Self {
             sup_block: sup_block,
             dev: device
-        }
+        };
+        
+        Ok(res_ok)
     }
 }
 
@@ -213,22 +202,48 @@ fn main() {
                 Err(err) => eprintln!("Error: {}", err),
             }
         }
+
         "mount" => {
-            let fs = TagFs::mount(device);
+            let res_fs = TagFs::mount(device);
+
+            if res_fs.is_err() {
+                let fs_err = res_fs.unwrap();
+                panic!("{:?}",fs_err);
+            }
+
             println!("Filesystem mounted");
         }
+
         "test_write" => {
-            let mut fs = TagFs::mount(device);
+            let res_fs = TagFs::mount(device);
+
+            if res_fs.is_err() {
+                let fs_err = res_fs.unwrap();
+                panic!("{:?}",fs_err);
+            }
+
+            let mut fs = res_fs.unwrap(); 
+
             let prova = vec![0x8;1024];
             let res = fs.write_into_block(&prova,1,0);
             println!("{:?}", res);
         }
+
         "test_read" => {
-            let mut fs = TagFs::mount(device);
-            let mut prova = vec![0x0;1024];
-            let _ = fs.read_from_block(&mut prova,1,0);
-            println!("{:?}", prova);
+            let res_fs = TagFs::mount(device);
+
+            if res_fs.is_err() {
+                let fs_err = res_fs.unwrap();
+                panic!("{:?}",fs_err);
+            }
+
+            let mut fs = res_fs.unwrap();
+            let mut read_buff = vec![0x0;1024];
+
+            let _ = fs.read_from_block(&mut read_buff,1,0);
+            println!("{:?}", read_buff);
         }
+
         _ => {
             eprintln!("Unsupported");
         }
