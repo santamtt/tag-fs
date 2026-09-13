@@ -1,19 +1,23 @@
-use pub_fields::pub_fields;
-
 pub use std::fs::*;
 pub use std::io::{
     Read, 
-    Seek, 
     Write,
+    Seek, 
+    SeekFrom,
     Result,
     Error,
     ErrorKind
 };
+pub use std::mem::size_of;
+
 pub use serde::{ Serialize, Deserialize };
+
+use pub_fields::pub_fields;
 
 pub const BOOT_SECTOR_SIZE:usize = 1024; // Kb
 pub const MAGIC: &[u8; 5] = b"TAGFS";
 pub const BLOCK_SIZE: usize = 4096; // Kb
+pub const INODE_TABLE_SIZE: usize = 2*(1 << 30); // Gb
 
 const BLOCK_GROUP_SIZE: usize = 128*(1 << 20); // Mb
 const BLOCKS_PER_GROUP: usize = BLOCK_GROUP_SIZE/BLOCK_SIZE;
@@ -25,11 +29,16 @@ pub struct SuperBlock {
    nr_inodes: u32,
    nr_blocks: u32,
    nr_tags: u32,
+   root_pos: u32,
+   free_i_bitmap: u64,
+   free_i_loc: u64,
+   free_d_loc: u64
 }
 
 impl SuperBlock {
     pub fn save(&self, fd: &mut File) -> Result<()> {
-        
+
+        fd.seek(SeekFrom::Start(1024))?; 
         let space_left: usize = BLOCK_SIZE - BOOT_SECTOR_SIZE; 
 
         let res_encoded = bincode::serialize(self).map_err(|e| {

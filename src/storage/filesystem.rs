@@ -1,8 +1,9 @@
 use crate::storage::superblock::*;
+use crate::storage::inode::*;
 
 #[derive(Debug)]
 pub struct TagFs {
-    sup_block: SuperBlock,
+    pub sup_block: SuperBlock,
     dev: File
 }
 
@@ -20,34 +21,6 @@ impl TagFs {
         }
 
         open.unwrap()
-    }
-
-
-    pub fn format(dev_name: &str) -> Result<()> {
-        let mut fd = Self::load_device(dev_name, true);
-
-        if BLOCK_SIZE < BOOT_SECTOR_SIZE{
-            panic!("block size is insufficient for storage purposes");
-        }
-
-        let sup_block = SuperBlock {
-            magic: *MAGIC,
-            nr_inodes: 0,
-            nr_blocks: 0,
-            nr_tags: 0
-        };
-
-        fd.write_all(&[0u8; 1024])?; // padding for boot sector
-
-        // write superblock
-        sup_block.save(&mut fd)?;
-
-        // Pad the rest of Block 0 with zeros
-        let current_pos = fd.stream_position()? as usize;
-        let padding = vec![0u8; BLOCK_SIZE - current_pos];
-        fd.write_all(&padding)?;
-
-        Ok(())
     }
 
     fn check_magic(magic_in: &[u8;5]) -> bool { magic_in == MAGIC }
@@ -90,6 +63,99 @@ impl TagFs {
         res
     }
 
+    fn find_next_free(&mut self, bitmap: &Vec<u8>, ) { 
+
+        let mut new_byte_pos: usize = 0;
+        let mut new_bit_pos: u8 = 0;
+        let mut is_full: bool = true;
+
+        'check: for byte_index in 0..bitmap.len() {
+            for i in 0..=8 {
+                let bit: bool = (bitmap[byte_index] >> i) & 0x1 != 0;
+
+                if bit { 
+                    is_full = false; 
+                    new_byte_pos = byte_index;
+                    new_bit_pos = i;
+                    break 'check
+                } 
+            }
+        }
+
+        if is_full {
+            self.sup_block.free_i_bitmap = 0;
+            self.sup_block.free_i_loc = 0; 
+            return ; 
+        }
+
+        let inode_size: usize = size_of::<Inode>(); 
+        let inode_pos: usize = (BLOCK_SIZE << 1)+(size_of::<u8>()*new_byte_pos+new_bit_pos as usize)*inode_size;
+
+        self.sup_block.free_i_bitmap = (BLOCK_SIZE + new_byte_pos) as u64;
+        self.sup_block.free_i_loc = inode_pos as u64; 
+    }
+
+    fn write_inode(&mut self, inode: &Inode) -> Result<()> {
+
+        // check first if inode i_block size is correct
+        inode.check_i_block_size()?;
+        if self.sup_block.free_i_bitmap == 0 && self.sup_block.free_i_loc == 0 { 
+            return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "cannot allocate inode: no space left"
+            ));
+        }
+
+        let curr_pos: usize = self.dev.stream_position()? as usize;
+        let inode_table_pos: usize = BOOT_SECTOR_SIZE + size_of::<SuperBlock>(); 
+
+        if curr_pos != inode_table_pos {
+            self.dev.seek(SeekFrom::Start(inode_table_pos as u64))?;
+        }
+
+        // retrieve inode bitmap from the
+        // disk, and use it to find the first
+        // free position 
+        let mut bitmap: Vec<u8> = vec![0u8; BLOCK_SIZE];
+        self.dev.read_exact(&mut bitmap)?;
+
+        let byte_pos: usize = (self.sup_block.free_i_bitmap / 8) as usize;
+        let bit_pos: u8 = (self.sup_block.free_i_bitmap % 8) as u8;
+
+        // calculate the inode position on the
+        // disk, save it and update the bitmap
+
+        let inode_size: usize = size_of::<Inode>(); 
+        let inode_pos: usize = (size_of::<u8>()*byte_pos+bit_pos as usize)*inode_size;
+
+        // TODO: substitute with relative
+        self.dev.seek(SeekFrom::Start(inode_pos as u64))?;
+
+        let res_encoded = bincode::serialize(inode).map_err(|e| {
+            Error::new(ErrorKind::InvalidData,e);
+        });
+
+        if res_encoded.is_err(){
+            return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "inode cannot be serialized correctly"
+            ));
+        }
+        
+        let mask_update: u8 = 0x1 << bit_pos; 
+        bitmap[byte_pos] |= mask_update;
+
+        // TODO: substitute with relative
+        self.find_next_free(&mut bitmap);
+        self.dev.seek(SeekFrom::Start(inode_table_pos as u64))?;
+        self.dev.write_all(&bitmap)?;
+        self.sup_block.nr_inodes += 1;
+
+        self.sup_block.save(&mut self.dev)?;
+
+        Ok(())
+    }
+
     pub fn mount(dev_name: &str) -> Result<Self> {
         let mut device = Self::load_device(dev_name, false);
         let mut boot_tmp: [u8;1024] = [0u8;1024]; 
@@ -109,5 +175,40 @@ impl TagFs {
         };
         
         Ok(res_ok)
+    }
+
+    pub fn format(dev_name: &str) -> Result<()> {
+        let mut fd = Self::load_device(dev_name, true);
+
+        if BLOCK_SIZE < BOOT_SECTOR_SIZE {
+          	return Err(Error::new(
+            	ErrorKind::OutOfMemory, "block size is insufficient for storage purposes"));
+        }
+
+        let inode_bitmap_pos : usize = size_of::<SuperBlock>() + BOOT_SECTOR_SIZE;
+        let inode_pos : usize = inode_bitmap_pos + BLOCK_SIZE; 
+
+        let sup_block = SuperBlock {
+            magic: *MAGIC,
+            nr_inodes: 0,
+            nr_blocks: 1,
+            nr_tags: 0,
+            root_pos: 0,
+            free_i_bitmap: inode_bitmap_pos as u64,
+            free_i_loc: inode_pos as u64,
+            free_d_loc: 0
+        };
+
+        fd.write_all(&[0u8; 1024])?; // padding for boot sector
+
+        // write superblock
+        sup_block.save(&mut fd)?;
+
+        // Pad the rest of Block 0 with zeros
+        let current_pos = fd.stream_position()? as usize;
+        let padding = vec![0u8; BLOCK_SIZE - current_pos];
+        fd.write_all(&padding)?;
+
+        Ok(())
     }
 }
