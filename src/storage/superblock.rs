@@ -9,37 +9,32 @@ pub use std::io::{
     ErrorKind
 };
 pub use std::mem::size_of;
-
 pub use serde::{ Serialize, Deserialize };
-
 use pub_fields::pub_fields;
 
-pub const BOOT_SECTOR_SIZE:usize = 1024; // Kb
 pub const MAGIC: &[u8; 5] = b"TAGFS";
-pub const BLOCK_SIZE: usize = 4096; // Kb
-pub const INODE_TABLE_SIZE: usize = 2*(1 << 30); // Gb
 
-const BLOCK_GROUP_SIZE: usize = 128*(1 << 20); // Mb
-const BLOCKS_PER_GROUP: usize = BLOCK_GROUP_SIZE/BLOCK_SIZE;
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize)]
 #[pub_fields]
+#[repr(C,align(4096))]
 pub struct SuperBlock {
    magic: [u8; 5],
+   timestamp: u64,
    nr_inodes: u32,
-   nr_blocks: u32,
-   nr_tags: u32,
-   root_pos: u32,
-   free_i_bitmap: u64,
-   free_i_loc: u64,
-   free_d_loc: u64
+   nr_segments: u32,
+   root_pos: u64,
+   block_size: u64,
+
+   seg_size: u64,
+   free_loc: u64,
+   chunk_size: u64,
 }
 
 impl SuperBlock {
     pub fn save(&self, fd: &mut File) -> Result<()> {
 
-        fd.seek(SeekFrom::Start(1024))?; 
-        let space_left: usize = BLOCK_SIZE - BOOT_SECTOR_SIZE; 
+        fd.seek(SeekFrom::Start(0))?; 
+        let space_left: usize = self.block_size as usize; 
 
         let res_encoded = bincode::serialize(self).map_err(|e| {
             Error::new(ErrorKind::InvalidData,e);
@@ -71,11 +66,19 @@ impl SuperBlock {
     }
 
     pub fn read(fd: &mut File) -> Result<Self> {
-        let sup_size: usize = BLOCK_SIZE - BOOT_SECTOR_SIZE;
 
-        let mut tmp_buff: Vec<u8> =  vec![0u8; sup_size];
+        let res_seek: Result<u64> = fd.seek(SeekFrom::Start(0)); 
+
+        if res_seek.is_err() {
+            return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "cannot align to initial sector size"));
+        }
+
+        let mut tmp_buff: Vec<u8> =  vec![0u8; size_of::<SuperBlock>()];
         fd.read_exact(&mut tmp_buff)?;
 
         bincode::deserialize(&tmp_buff).map_err(Error::other)
     }
+
 }
