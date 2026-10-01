@@ -8,8 +8,12 @@ use std::io::{
     Error,
     ErrorKind
 };
+
+use crate::storage::SuperBlock;
+
 use std::mem::size_of;
 use serde::{ Serialize, Deserialize };
+use serde::de::DeserializeOwned;
 
 #[derive(Debug)]
 pub struct Alloc{
@@ -44,52 +48,49 @@ impl Alloc {
         self.storage_dev.seek_relative(final_pos)
     }
 
-    pub fn write_into_dev(&mut self, buff: &Vec<u8>, pos: usize, size_in: usize) -> Result<()> {
-
-        if buff.len() > size_in {
-            return Err(
-                Error::new(ErrorKind::OutOfMemory, "write size overflow"));
-        }
-
-        if buff.len() == 0 {
-            return Err(
-                Error::new(ErrorKind::OutOfMemory, "attempt to write an empty buffer"));
-        }
+    pub fn direct_write<T: Serialize>(&mut self, obj: &T, pos: u64) -> Result<()> {
 
         self._go_to(pos as u64)?;
-        self.storage_dev.write_all(buff)?;
+
+        let res = bincode::serialize(obj).map_err(Error::other);
+        if res.is_err() { return Err(res.err().unwrap()); }
+
+        self.storage_dev.write_all(&res.unwrap())?;
         Ok(())
 
     }
 
-    fn read_obj(&mut self, size: usize) -> Result<Vec<u8>> {
+    fn direct_read<T: DeserializeOwned>(&mut self) -> Result<T> {
 
+        let size = size_of::<T>();
         let mut read_buff: Vec<u8> = vec![0u8; size];
 
         let res_read = self.storage_dev.read_exact(&mut read_buff);
         if res_read.is_err() { return Err(res_read.err().unwrap()); }
+        let read_slice = &read_buff.as_slice();
 
-        Ok(read_buff)
+        bincode::deserialize(read_slice).map_err(Error::other)
     }
 
-    pub fn read_obj_from_pos(&mut self, loc: u64, size: usize) -> Result<Vec<u8>> {
+    pub fn direct_read_from_pos<T: DeserializeOwned>(&mut self, loc: u64) -> Result<T> {
         let disk_move = self._go_to(loc);
-        if disk_move.is_err() { return Err(disk_move.err().unwrap()); }
-        self.read_obj(size)
+        self.direct_read()
     }
    
-    pub fn save_superblock(&mut self, superblock: &Vec<u8>, size_in: usize) -> Result<()> {
-        self.write_into_dev(superblock, 0, size_in)
+    pub fn save_superblock(&mut self, superblock: &SuperBlock) -> Result<()> {
+        self.direct_write::<SuperBlock>(superblock, 0)
     }
 
-    pub fn read_superblock(&mut self, size_in: usize) -> Result<Vec<u8>> {
+    pub fn read_superblock(&mut self) -> Result<SuperBlock> {
         self._go_to(0)?;
 
-        let mut buff: Vec<u8> = vec![0u8; size_in];
+        let mut buff: Vec<u8> = vec![0u8; size_of::<SuperBlock>()];
         let res = self.storage_dev.read_exact(&mut buff);
         if res.is_err() { return Err(res.err().unwrap()); }
 
-        Ok(buff)
+        bincode::deserialize(&buff).map_err(Error::other)
     }
+
+
 
 }

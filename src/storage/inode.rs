@@ -106,12 +106,10 @@ impl Inode{
         new_inode
     }
 
-
     fn _check_permissions(&self) -> bool {
 
         let my_gid = unsafe { getegid() };
         let my_uid = unsafe { geteuid() };
-        let mut res = true;
         let mut shift = 8;
 
         if my_uid != self.uid {
@@ -121,24 +119,6 @@ impl Inode{
         let mask: u16 = 0x2 << shift;
 
         self.mode & mask == mask 
-    }
-
-    pub fn serialize(&self) -> Result<Vec<u8>>{
-        let res_encoded = bincode::serialize(self).map_err(Error::other);
-
-        if res_encoded.is_err(){
-            return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Superblock cannot be serialized correctly"
-            ));
-        }
-
-        res_encoded 
-    }
-
-    pub fn deserialize(bytes_in: &Vec<u8>) -> Result<Self>{
-        let res_inode: Result<Inode> = bincode::deserialize(bytes_in).map_err(Error::other);;
-        res_inode
     }
 
     pub fn write(&mut self, bytes_in: &Vec<u8>) -> bool {

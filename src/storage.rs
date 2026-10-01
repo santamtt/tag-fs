@@ -28,48 +28,22 @@ pub struct TagFs {
 
 impl TagFs {
 
-    fn new_load_device(dev_name: &str, enable_trunc: bool) -> Alloc {
-        Alloc::new(dev_name, enable_trunc)
-    }
-
-    fn load_device(dev_name: &str, enable_trunc: bool) -> File {
-        let open = File::options()
-            .read(true)
-            .write(true)
-            .truncate(enable_trunc)
-            .open(dev_name);
-
-        if open.is_err() {
-            panic!("something went wrong: {}", open.err().unwrap());
-        }
-
-        open.unwrap()
-    }
-
     fn check_magic(magic_in: &[u8;5]) -> bool { magic_in == MAGIC }
 
-    
     fn _alloc_inode(&mut self, i_type: InodeType) -> Result<Inode> {
         let new_inode = Inode::new(i_type, 0);
         Ok(new_inode)
     }
 
     fn _alloc_root(sup_block: &SuperBlock, alloc: &mut Alloc) -> Result<()> {
-        
         let mut root_inode = Inode::new(InodeType::File, 0);
-        let serialized_root = root_inode.serialize();
-        if serialized_root.is_err() {
-            return Err(Error::new(
-                    ErrorKind::InvalidData, "Cannot serialize root inode"));
-        }
-
-        alloc.write_into_dev(&serialized_root.unwrap(), sup_block.root_pos as usize, size_of::<Inode>())
+        alloc.direct_write::<Inode>(&root_inode, sup_block.root_pos)
     }
 
     pub fn _read_root(&mut self) -> Result<()> {
-        let disk_inode = self.alloc.read_obj_from_pos(self.sup_block.root_pos, size_of::<Inode>());
+        let disk_inode = self.alloc.direct_read_from_pos::<Inode>(self.sup_block.root_pos);
         if disk_inode.is_err() { return Err(disk_inode.err().unwrap()); }
-        let res_inode = Inode::deserialize(&disk_inode.unwrap());
+        let res_inode = disk_inode.unwrap();
         Ok(())
     }
 
@@ -92,11 +66,9 @@ impl TagFs {
 
         let mut alloc = Alloc::new(dev_name, false);
 
-        let res_sup_block = alloc.read_superblock(size_of::<SuperBlock>());
+        let res_sup_block = alloc.read_superblock();
         if res_sup_block.is_err() { return Err(res_sup_block.err().unwrap()); }
-        let read_sup_block = res_sup_block.unwrap();
-
-        let sup_block = SuperBlock::read(&read_sup_block)?;
+        let sup_block = res_sup_block.unwrap();
 
         if !Self::check_magic(&sup_block.magic) {
             return Err(Error::new(
@@ -135,8 +107,7 @@ impl TagFs {
         };
 
         // write superblock
-        let serialized_sup: Vec<u8> = sup_block.serialize()?;
-        alloc.save_superblock(&serialized_sup, size_of::<SuperBlock>())?;
+        alloc.save_superblock(&sup_block)?;
         Self::_alloc_root(&sup_block, &mut alloc)?;
 
         Ok(())
