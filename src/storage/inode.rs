@@ -4,8 +4,12 @@ use std::io::{
     ErrorKind
 };
 
-use libc::*;
-pub use serde::{ Serialize, Deserialize };
+use libc::{ 
+    getegid, 
+    geteuid, 
+    clock_gettime 
+};
+use serde::{ Serialize, Deserialize };
 
 #[derive(Copy, Clone)]
 #[derive(Serialize, Deserialize)]
@@ -54,8 +58,8 @@ impl Inode{
 
     pub fn new(i_type: InodeType, id: u64) -> Self {
 
-        let local_gid = unsafe { libc::getegid() };
-        let local_uid = unsafe { libc::geteuid() };
+        let local_gid = unsafe { getegid() };
+        let local_uid = unsafe { geteuid() };
 
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -63,7 +67,7 @@ impl Inode{
         };
 
         unsafe {
-            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            clock_gettime(libc::CLOCK_REALTIME, &mut ts);
         };
 
         let new_inode = Inode {
@@ -105,8 +109,8 @@ impl Inode{
 
     fn _check_permissions(&self) -> bool {
 
-        let my_gid = unsafe { libc::getegid() };
-        let my_uid = unsafe { libc::geteuid() };
+        let my_gid = unsafe { getegid() };
+        let my_uid = unsafe { geteuid() };
         let mut res = true;
         let mut shift = 8;
 
@@ -133,9 +137,7 @@ impl Inode{
     }
 
     pub fn deserialize(bytes_in: &Vec<u8>) -> Result<Self>{
-
-        let res_inode: Inode = bincode::deserialize(bytes_in).map_err(Error::other)
-
+        let res_inode: Result<Inode> = bincode::deserialize(bytes_in).map_err(Error::other);;
         res_inode
     }
 

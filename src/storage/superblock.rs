@@ -1,5 +1,5 @@
-pub use std::fs::*;
-pub use std::io::{
+use std::fs::*;
+use std::io::{
     Read, 
     Write,
     Seek, 
@@ -8,8 +8,8 @@ pub use std::io::{
     Error,
     ErrorKind
 };
-pub use std::mem::size_of;
-pub use serde::{ Serialize, Deserialize };
+use std::mem::size_of;
+use serde::{ Serialize, Deserialize };
 use pub_fields::pub_fields;
 
 pub const MAGIC: &[u8; 5] = b"TAGFS";
@@ -31,6 +31,7 @@ pub struct SuperBlock {
 }
 
 impl SuperBlock {
+
     pub fn save(&self, fd: &mut File) -> Result<()> {
 
         fd.seek(SeekFrom::Start(0))?; 
@@ -65,20 +66,14 @@ impl SuperBlock {
         Ok(())
     }
 
-    pub fn read(fd: &mut File) -> Result<Self> {
+    pub fn serialize(&self) -> Result<Vec<u8>> {
 
-        let res_seek: Result<u64> = fd.seek(SeekFrom::Start(0)); 
+        let res_encoded = bincode::serialize(self).map_err(Error::other);
+        res_encoded
+    }
 
-        if res_seek.is_err() {
-            return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "cannot align to initial sector size"));
-        }
-
-        let mut tmp_buff: Vec<u8> =  vec![0u8; size_of::<SuperBlock>()];
-        fd.read_exact(&mut tmp_buff)?;
-
-        bincode::deserialize(&tmp_buff).map_err(Error::other)
+    pub fn read(buff_in: &Vec<u8>) -> Result<Self> {
+        bincode::deserialize(&buff_in).map_err(Error::other)
     }
 
 }
