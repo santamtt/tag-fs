@@ -5,7 +5,7 @@ use std::env;
 use std::io::Result;
 
 mod storage;
-use crate::storage::filesystem::TagFs;
+use crate::storage::TagFs;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -37,7 +37,7 @@ fn main() {
             println!("Filesystem mounted");
         }
 
-        "test_write" => {
+        "test_alloc" => {
             let res_fs = TagFs::mount(device);
 
             if res_fs.is_err() {
@@ -46,13 +46,14 @@ fn main() {
             }
 
             let mut fs = res_fs.unwrap(); 
-
-            let prova = vec![0x8;1024];
-            let res = fs.write_into_block(&prova,1,0);
-            println!("{:?}", res);
+            let res = fs.write_file(0,String::from("Hello World").into_bytes());
+            if res.is_err() {
+                let fs_err = res.unwrap();
+                panic!("{:?}",fs_err);
+            }
         }
 
-        "test_read" => {
+        "test_tag" => {
             let res_fs = TagFs::mount(device);
 
             if res_fs.is_err() {
@@ -60,11 +61,12 @@ fn main() {
                 panic!("{:?}",fs_err);
             }
 
-            let mut fs = res_fs.unwrap();
-            let mut read_buff = vec![0x0;1024];
-
-            let _ = fs.read_from_block(&mut read_buff,1,0);
-            println!("{:?}", read_buff);
+            let mut fs = res_fs.unwrap(); 
+            let res = fs.register_tag("prova");
+            if res.is_err() {
+                let fs_err = res.unwrap();
+                panic!("{:?}",fs_err);
+            }
         }
 
         _ => {

@@ -11,10 +11,17 @@ pub struct SuperBlock {
    timestamp: u64,
    nr_inodes: u32,
    nr_segments: u32,
-   root_pos: u64,
+   root_id: u64,
    block_size: u64,
 
    seg_size: u64,
    free_loc: u64,
    chunk_size: u64,
+
+   obj_table: u64,
+   obj_id: u64
+}
+
+impl SuperBlock {
+    pub fn check_magic(&self) -> bool { self.magic == *MAGIC }
 }

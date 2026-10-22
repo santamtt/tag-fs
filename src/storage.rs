@@ -1,114 +1,143 @@
 mod superblock;
 mod inode;
-mod node;
-mod alloc; 
+mod extent;
+mod alloc;
+mod open;
 
-use crate::storage::superblock::*;
 use crate::storage::inode::*;
-use crate::storage::node::*;
+use crate::storage::extent::*;
 use crate::storage::alloc::*;
 
-use std::fs::*;
+use crate::storage::open::*;
+
 use std::io::{
-    Read, 
-    Write,
-    Seek, 
-    SeekFrom,
     Result,
     Error,
     ErrorKind
 };
-use std::mem::size_of;
+
+use std::cmp::min;
 
 #[derive(Debug)]
 pub struct TagFs {
-    pub sup_block: SuperBlock,
-    alloc: Alloc
+    alloc: Alloc,
+    open: Vec<OpenEntry>
 }
 
 impl TagFs {
 
-    fn check_magic(magic_in: &[u8;5]) -> bool { magic_in == MAGIC }
-
     fn _alloc_inode(&mut self, i_type: InodeType) -> Result<Inode> {
-        let new_inode = Inode::new(i_type, 0);
+        let new_inode = Inode::new(i_type);
         Ok(new_inode)
     }
 
-    fn _alloc_root(sup_block: &SuperBlock, alloc: &mut Alloc) -> Result<()> {
-        let mut root_inode = Inode::new(InodeType::File, 0);
-        alloc.direct_write::<Inode>(&root_inode, sup_block.root_pos)
-    }
+    fn _alloc_root(alloc: &mut Alloc) -> Result<()> {
+        let root_inode = Inode::new(InodeType::Tag);
 
-    pub fn _read_root(&mut self) -> Result<()> {
-        let disk_inode = self.alloc.direct_read_from_pos::<Inode>(self.sup_block.root_pos);
-        if disk_inode.is_err() { return Err(disk_inode.err().unwrap()); }
-        let res_inode = disk_inode.unwrap();
+        let alloc_res = alloc.register_obj::<Inode>(&root_inode);
+        if alloc_res.is_err() { return Err(alloc_res.err().unwrap()); }
+
         Ok(())
     }
 
-    pub fn write_file(&mut self, bytes_in: Vec<u8>) -> Result<()> {
+    pub fn register_tag(&mut self, tag_name: &str) -> Result<()> {
 
-        let mut res_inode = self._alloc_inode(InodeType::File);
+        let mut inode_root = self.alloc.read_root()?;
 
-        match res_inode {
-            Ok(mut inode) => {
-                inode.write(&bytes_in);
-                return Ok(());
-            },
-            Err(e) => {
-                return Err(e);
-            }
+        let tag_inode: Inode = Inode::new(InodeType::Tag);
+
+        let alloc_inode = self.alloc.register_obj::<Inode>(&tag_inode);
+        if alloc_inode.is_err() { return Err(alloc_inode.err().unwrap()); }
+        let inode_id: u64 = alloc_inode.unwrap();
+
+        if !inode_root.add_tag_element(tag_name, inode_id) { return Err(
+            Error::new(
+                ErrorKind::InvalidData, "Cannot add tag element in the root"));
         }
+        self.alloc.commit_root(&inode_root)
+    }
+
+    pub fn open_file(&mut self, path: u64) -> Result<usize> {
+        let mut file_ref = OpenEntry::new();
+        file_ref.id = path;
+        self.open.push(file_ref);
+        Ok(self.open.len() - 1)
+    }
+
+    pub fn close_file(&mut self, fd: usize) -> Result<()> {
+        if self.open.len() < fd { 
+            return Err(Error::new(ErrorKind::Other,"Close failed: file is not opened")); 
+        }
+
+        self.open.remove(fd);
+        Ok(())
+    }
+
+    pub fn read_file(&mut self, fd: usize, read_size: usize) -> Result<Vec<u8>> {
+
+        if fd >= self.open.len() { 
+            return Err(Error::new(ErrorKind::Other,"Read failed: file is not opened")); 
+        }
+        
+        let state: &mut OpenEntry = &mut self.open[fd];
+        let inode: Inode = self.alloc.read_obj::<Inode>(state.id)?;
+
+        let mut data: Vec<u8> = Vec::new();
+
+        match self.alloc.file_seek(&inode, state.offset) {
+            ExtentType::Direct => {
+                let offset_usize: usize = state.offset as usize;
+                let inode_payload_usize: usize = INODE_PAYLOAD as usize;
+                let end: usize= min(read_size + offset_usize, inode_payload_usize);
+
+                let read_payload: usize = end - offset_usize;
+
+                data.append(&mut inode.payload[offset_usize..end].to_vec());
+            },
+            ExtentType::Indirect(extent) => { todo!("Indirect extent read handling"); },
+            ExtentType::Invalid => { return Err(Error::new(ErrorKind::InvalidData, "Bad read alloc: invalid seek")); }
+        }
+        
+        Ok(data)
+    }
+
+    pub fn write_file(&mut self, fd: usize, bytes_in: Vec<u8>) -> Result<()> {
+
+        if fd >= self.open.len() { 
+            return Err(Error::new(ErrorKind::Other,"Write failed: file is not opened")); 
+        }
+        
+        let state: &mut OpenEntry = &mut self.open[fd];
+        let mut inode: Inode = self.alloc.read_obj::<Inode>(state.id)?;
+        
+        match self.alloc.file_seek(&inode, state.offset) {
+            ExtentType::Direct => {
+                inode.write(state.offset, &bytes_in[0..(INODE_PAYLOAD - state.offset) as usize].to_vec());
+                state.offset += INODE_PAYLOAD - state.offset;
+            },
+            ExtentType::Indirect(extent) => { todo!("Indirect extent write handling"); }
+            ExtentType::Invalid => { return Err(Error::new(ErrorKind::InvalidData, "Bad write alloc: invalid seek")); }
+        }
+
+        self.alloc.commit::<Inode>(&inode, state.id)
     }
 
     pub fn mount(dev_name: &str) -> Result<Self> {
 
-        let mut alloc = Alloc::new(dev_name, false);
-
-        let res_sup_block = alloc.read_superblock();
-        if res_sup_block.is_err() { return Err(res_sup_block.err().unwrap()); }
-        let sup_block = res_sup_block.unwrap();
-
-        if !Self::check_magic(&sup_block.magic) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Filesystem magic number did not match"));
+        match Alloc::mount(dev_name) {
+            Ok(alloc) => {
+                return Ok(Self { alloc: alloc, open: vec![OpenEntry::new();3] });
+            },
+            Err(e) => { return Err(e); }
         }
 
-        let res_ok = Self {
-            sup_block: sup_block,
-            alloc: alloc 
-        };
-        
-        Ok(res_ok)
     }
 
     pub fn format(dev_name: &str) -> Result<()> {
 
         let mut alloc = Alloc::new(dev_name, true);
-
-        let local_block_size: u64 = 4096; // bytes (4 kb)
-        let local_chunk_size: u64 = 16*local_block_size as u64;
-        let local_seg_size: u64 = 512*local_block_size; // 2 Mb
-
-        let sup_block = SuperBlock {
-            magic: *MAGIC,
-            timestamp: 0,
-            nr_inodes: 0,
-            nr_segments: 2,
-            root_pos: local_seg_size as u64 + local_block_size,
-            block_size: local_block_size,
-
-            seg_size: local_seg_size,
-            free_loc: local_seg_size,
-
-            chunk_size: local_chunk_size,
-        };
-
-        // write superblock
-        alloc.save_superblock(&sup_block)?;
-        Self::_alloc_root(&sup_block, &mut alloc)?;
+        alloc.format_disk()?;
+        Self::_alloc_root(&mut alloc)?;
 
         Ok(())
     }
