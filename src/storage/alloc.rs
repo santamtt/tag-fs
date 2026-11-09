@@ -12,6 +12,8 @@ use std::io::{
 use crate::storage::superblock::*;
 use crate::storage::inode::*;
 use crate::storage::extent::*;
+use crate::storage::lst::*;
+use crate::storage::segment::*;
 
 use std::mem::size_of;
 use serde::Serialize;
@@ -20,7 +22,9 @@ use serde::de::DeserializeOwned;
 #[derive(Debug)]
 pub struct Alloc{
     storage_dev: File,
-    sup_block: SuperBlock
+    sup_block: SuperBlock,
+    lst: Vec<LstEntry>,
+    seg_tree: SegTree
 }
 
 impl Alloc {
@@ -39,24 +43,27 @@ impl Alloc {
 
         let sup_block = SuperBlock {
             magic: [0u8;5],
-            timestamp: 0,
+            generation: 0,
             nr_inodes: 0,
-            nr_segments: 0,
             root_id: 0,
             block_size: 0,
 
             seg_size: 0,
             free_loc: 0,
+            nr_segments: 0,
 
             chunk_size: 0,
-            obj_table: 0,
-            obj_id: 0
+            sgn_table_loc: 0,
+            sgn_table_size: 0,
+            sgn_id: 0
         };
 
 
         Self {
             storage_dev: open.unwrap(),
-            sup_block: sup_block
+            sup_block: sup_block,
+            lst: Vec::new(),
+            seg_tree: SegTree::new()
         }
     }
 
@@ -71,6 +78,7 @@ impl Alloc {
                 "Filesystem magic number did not match"));
         }
 
+        alloc_ret._load_lst()?;
         alloc_ret.sup_block = sup_block;
         Ok(alloc_ret)
     }
@@ -93,10 +101,9 @@ impl Alloc {
 
     }
 
-    fn _direct_read<T: DeserializeOwned>(&mut self, loc: u64) -> Result<T> {
+    fn _direct_read<T: DeserializeOwned>(&mut self, loc: u64, size: usize) -> Result<T> {
         let disk_move = self._go_to(loc)?;
 
-        let size = size_of::<T>();
         let mut read_buff: Vec<u8> = vec![0u8; size];
 
         let res_read = self.storage_dev.read_exact(&mut read_buff)?;
@@ -128,20 +135,20 @@ impl Alloc {
     }
 
     pub fn read_superblock(&mut self) -> Result<SuperBlock> {
-        self._direct_read::<SuperBlock>(0)
+        self._direct_read::<SuperBlock>(0, size_of::<SuperBlock>())
     }
 
     pub fn format_disk(&mut self) -> Result<()> {
 
-        let local_block_size: u64 = 4096; // bytes (4 kb)
-        let local_chunk_size: u64 = 16*local_block_size;
-        let local_seg_size: u64 = 512*local_block_size; // 2 Mb
+        let local_block_size: u64 = 4096; // bytes (4 Kib)
+        let local_chunk_size: u64 = local_block_size << 4; // 64 Kib
+        let local_seg_size: u64 = local_block_size << 18; // 1 Gib 
 
         let sup_block = SuperBlock {
             magic: *MAGIC,
-            timestamp: 0,
+            generation: 0,
             nr_inodes: 0,
-            nr_segments: 1,
+            nr_segments: 0,
             block_size: local_block_size,
             seg_size: local_seg_size,
 
@@ -149,9 +156,10 @@ impl Alloc {
             free_loc: 2*local_seg_size,
 
             chunk_size: local_chunk_size,
-            obj_table: local_seg_size,
+            sgn_table_loc: local_seg_size,
+            sgn_table_size: local_seg_size,
 
-            obj_id: 0
+            sgn_id: 0
         };
 
         self.save_superblock(&sup_block)?;
@@ -159,59 +167,81 @@ impl Alloc {
         Ok(())
     }
 
-    fn _access_obj_table(&mut self, obj_id: u64) -> Result<()> {
-        let obj_reg: u64 = obj_id + self.sup_block.obj_table;
+    fn _load_lst(&mut self) -> Result<()> {
 
-        if obj_id >= self.sup_block.seg_size {
-            let err_msg: &str =
-                "in function _access_obj_table: cannot allocate more objects in the device: object table is full";
+        let seg_size: u64 = self.sup_block.seg_size;
+        let lst_pos: u64 = if self.sup_block.generation & 0x1 == 0x1 { seg_size >> 1 } else { seg_size }; 
 
-            return Err(Error::new(
-                    ErrorKind::StorageFull, err_msg));
+        self.lst = self._direct_read::<Vec<LstEntry>>(lst_pos, (self.sup_block.nr_segments as usize)*size_of::<LstEntry>())?;
+
+        Ok(())
+
+    }
+
+    fn _commit_lst(&mut self) -> Result<()> {
+
+        let seg_size: u64 = self.sup_block.seg_size;
+        let lst_pos: u64 = if self.sup_block.generation & 0x1 == 0x1 { seg_size >> 1 } else { seg_size }; 
+        let lst_ref = self.lst.clone();
+        self._direct_write::<Vec<LstEntry>>(&lst_ref, lst_pos)?;
+        
+        Ok(())
+    }
+
+    fn _get_sgn_id(&self, id: u128) -> u64 {
+        let mask: u128 = 0xFFFFFFFF;
+        (id >> 64 & mask) as u64
+    }
+
+    fn _get_obj_pos(&mut self, id: u128) -> Result<u64>{
+        todo!("Not implemented yet");
+    }
+
+    fn _update_sgn_pos(&mut self, sgn_id: u64, new_loc: u64) -> Result<()> {
+        self.lst[sgn_id as usize].phys_location = new_loc;
+        self.sup_block.generation += 1;
+
+        if self.sup_block.generation % 10 == 0 {
+            return self._commit_lst();
         }
 
-        self._go_to(obj_reg)
+        Ok(())
     }
 
-    fn _get_obj_pos(&mut self, id: u64) -> Result<u64>{
-        self._access_obj_table(id)?;
-        let mut addr_read: Vec<u8> = vec![0u8;8];
-        self.storage_dev.read_exact(&mut addr_read)?;
-
-        Ok(u64::from_ne_bytes(addr_read[0..=7].try_into().unwrap()))
+    fn _update_obj_pos(&mut self, obj_id: u128, new_loc: u64) -> Result<()> {
+        todo!("Not implemented yet");
     }
 
-    fn _update_obj_pos(&mut self, obj_id: u64, new_loc: u64) -> Result<()> {
-        self._access_obj_table(obj_id)?;
-        self.storage_dev.write_all(&new_loc.to_ne_bytes())
+    fn _register_sgn(&mut self) -> Result<u64> {
+
+        self.lst.push(LstEntry::new());
+        self.sup_block.nr_segments += 1;
+        let curr_sgn_id: u64 = self.lst.len() as u64; 
+
+        if self.sup_block.generation % 10 == 0{
+    
+            self._commit_lst()?;
+            self._update_superblock()?;
+        }
+
+        Ok(curr_sgn_id)
+
     }
 
-    pub fn read_obj<T: DeserializeOwned>(&mut self, id: u64) -> Result<T> {
+    pub fn read_obj<T: DeserializeOwned>(&mut self, id: u128) -> Result<T> {
         let obj_pos: u64 = self._get_obj_pos(id)?;
-        self._direct_read::<T>(obj_pos)
+        self._direct_read::<T>(obj_pos, size_of::<T>())
     }
 
-    pub fn register_obj<T: Serialize>(&mut self, obj: &T) -> Result<u64> {
-
-        let curr_obj_id: u64 = self.sup_block.obj_id;
-        self._access_obj_table(curr_obj_id)?;
-
-        self.storage_dev.write_all(&self.sup_block.free_loc.to_ne_bytes())?;
-
-        self._direct_write::<T>(obj, self.sup_block.free_loc)?;
-
-        self.sup_block.obj_id += 1;
-        self.sup_block.free_loc += size_of::<T>() as u64;
-
-        self._update_superblock()?;
-        Ok(curr_obj_id)
-
+    pub fn register_inode(&mut self, obj: &Inode) -> Result<u64> {
+        Ok(0)
     }
 
-    pub fn commit<T: Serialize>(&mut self, obj: &T, obj_id: u64) -> Result<()> {
+    pub fn commit<T: Serialize>(&mut self, obj: &T, obj_id: u128) -> Result<()> {
         let new_obj_pos: u64 = self.sup_block.free_loc;
         self._direct_write::<T>(obj, self.sup_block.free_loc)?;
         self.sup_block.free_loc += size_of::<T>() as u64;
+        self.sup_block.generation += 1;
         self._update_superblock()?;
         self._update_obj_pos(obj_id, new_obj_pos)
     }

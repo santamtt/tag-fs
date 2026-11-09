@@ -3,10 +3,14 @@ mod inode;
 mod extent;
 mod alloc;
 mod open;
+mod lst;
+mod segment;
+mod data_structures;
 
 use crate::storage::inode::*;
 use crate::storage::extent::*;
 use crate::storage::alloc::*;
+use crate::storage::data_structures::mem_arena::Arena;
 
 use crate::storage::open::*;
 
@@ -21,7 +25,7 @@ use std::cmp::min;
 #[derive(Debug)]
 pub struct TagFs {
     alloc: Alloc,
-    open: Vec<OpenEntry>
+    open: Arena<OpenEntry>
 }
 
 impl TagFs {
@@ -34,7 +38,7 @@ impl TagFs {
     fn _alloc_root(alloc: &mut Alloc) -> Result<()> {
         let root_inode = Inode::new(InodeType::Tag);
 
-        let alloc_res = alloc.register_obj::<Inode>(&root_inode);
+        let alloc_res = alloc.register_inode(&root_inode);
         if alloc_res.is_err() { return Err(alloc_res.err().unwrap()); }
 
         Ok(())
@@ -45,10 +49,7 @@ impl TagFs {
         let mut inode_root = self.alloc.read_root()?;
 
         let tag_inode: Inode = Inode::new(InodeType::Tag);
-
-        let alloc_inode = self.alloc.register_obj::<Inode>(&tag_inode);
-        if alloc_inode.is_err() { return Err(alloc_inode.err().unwrap()); }
-        let inode_id: u64 = alloc_inode.unwrap();
+        let inode_id: u64 = self.alloc.register_inode(&tag_inode)?;
 
         if !inode_root.add_tag_element(tag_name, inode_id) { return Err(
             Error::new(
@@ -57,32 +58,43 @@ impl TagFs {
         self.alloc.commit_root(&inode_root)
     }
 
-    pub fn open_file(&mut self, path: u64) -> Result<usize> {
+    pub fn open_file(&mut self, path: u128) -> Result<usize> {
         let mut file_ref = OpenEntry::new();
         file_ref.id = path;
-        self.open.push(file_ref);
-        Ok(self.open.len() - 1)
+        let ret = self.open.insert(file_ref);
+        Ok(ret)
     }
 
     pub fn close_file(&mut self, fd: usize) -> Result<()> {
-        if self.open.len() < fd { 
+        if !self.open.delete(fd) { 
             return Err(Error::new(ErrorKind::Other,"Close failed: file is not opened")); 
         }
 
-        self.open.remove(fd);
         Ok(())
+    }
+
+    fn _read_inode(&mut self, fd: usize) -> Result<Inode> {
+
+        if fd >= self.open.elements.len() { 
+            return Err(Error::new(ErrorKind::Other,"Read failed: file is not opened")); 
+        }
+        
+        match self.open.elements[fd] {
+            Some(state) => {
+                return self.alloc.read_obj::<Inode>(state.id);
+            },
+
+            None => { 
+                return Err(Error::new(ErrorKind::Other, format!("Cannot open file with inode id {}",fd)));
+            }
+        }
     }
 
     pub fn read_file(&mut self, fd: usize, read_size: usize) -> Result<Vec<u8>> {
 
-        if fd >= self.open.len() { 
-            return Err(Error::new(ErrorKind::Other,"Read failed: file is not opened")); 
-        }
-        
-        let state: &mut OpenEntry = &mut self.open[fd];
-        let inode: Inode = self.alloc.read_obj::<Inode>(state.id)?;
-
+        let mut inode: Inode = self._read_inode(fd)?;
         let mut data: Vec<u8> = Vec::new();
+        let mut state: OpenEntry = self.open.elements[fd].unwrap(); 
 
         match self.alloc.file_seek(&inode, state.offset) {
             ExtentType::Direct => {
@@ -93,6 +105,7 @@ impl TagFs {
                 let read_payload: usize = end - offset_usize;
 
                 data.append(&mut inode.payload[offset_usize..end].to_vec());
+                self.open.elements[fd] = Option::Some(state);
             },
             ExtentType::Indirect(extent) => { todo!("Indirect extent read handling"); },
             ExtentType::Invalid => { return Err(Error::new(ErrorKind::InvalidData, "Bad read alloc: invalid seek")); }
@@ -103,17 +116,14 @@ impl TagFs {
 
     pub fn write_file(&mut self, fd: usize, bytes_in: Vec<u8>) -> Result<()> {
 
-        if fd >= self.open.len() { 
-            return Err(Error::new(ErrorKind::Other,"Write failed: file is not opened")); 
-        }
-        
-        let state: &mut OpenEntry = &mut self.open[fd];
-        let mut inode: Inode = self.alloc.read_obj::<Inode>(state.id)?;
-        
+        let mut inode: Inode = self._read_inode(fd)?; 
+        let mut state: OpenEntry = self.open.elements[fd].unwrap(); 
+
         match self.alloc.file_seek(&inode, state.offset) {
             ExtentType::Direct => {
                 inode.write(state.offset, &bytes_in[0..(INODE_PAYLOAD - state.offset) as usize].to_vec());
                 state.offset += INODE_PAYLOAD - state.offset;
+                self.open.elements[fd] = Option::Some(state);
             },
             ExtentType::Indirect(extent) => { todo!("Indirect extent write handling"); }
             ExtentType::Invalid => { return Err(Error::new(ErrorKind::InvalidData, "Bad write alloc: invalid seek")); }
@@ -126,7 +136,7 @@ impl TagFs {
 
         match Alloc::mount(dev_name) {
             Ok(alloc) => {
-                return Ok(Self { alloc: alloc, open: vec![OpenEntry::new();3] });
+                return Ok(Self { alloc: alloc, open: Arena::new() });
             },
             Err(e) => { return Err(e); }
         }
