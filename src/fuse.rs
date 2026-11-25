@@ -1,10 +1,11 @@
-use crate::storage::TagFs;
+use crate::storage::{SetAttr, TagFs};
 use crate::storage::{ FileKind, FileStat };
 use crate::storage::errno;
 
 use core::time::Duration;
+use std::time::SystemTime;
 
-use fuser::Filesystem;
+use fuser::{Filesystem, TimeOrNow};
 use fuser::{ FileAttr, FileType, FileHandle };
 use fuser::{ Request, INodeNo, Errno, Generation};
 use fuser::{ ReplyAttr, ReplyEntry, ReplyDirectory };
@@ -42,6 +43,23 @@ fn get_kind_fuse(kind: &FileKind) -> FileType {
     }
 }
 
+fn convert_timestamp(timestamp_in: &Option<TimeOrNow>) -> Option<SystemTime> {
+    match timestamp_in {
+        Some(timestamp) => {
+
+            let mut time_ret: SystemTime = SystemTime::now();
+
+            if let TimeOrNow::SpecificTime(time) = *timestamp {
+                time_ret = time;
+            }
+
+            Option::Some(time_ret)
+        }, None => {
+            Option::None
+        }
+    }
+}
+
 impl Filesystem for TagFs {
 
     fn lookup(&self, _r: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -58,6 +76,45 @@ impl Filesystem for TagFs {
                 let ttl = Duration::from_secs(1);
                 let fuse_attr = get_attr_fuse(&attr);
                 reply.entry(&ttl, &fuse_attr, Generation(0));
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let ino_attr: SetAttr =  SetAttr {
+            mode: mode,
+            uid: uid,
+            gid: gid,
+            size: size,
+            atime: convert_timestamp(&_atime),
+            mtime: convert_timestamp(&_mtime),
+        };
+
+        match self.setattr(ino.0, &ino_attr) {
+            Ok(attr) => {
+                let ttl = Duration::from_secs(1);
+                let fuse_attr = get_attr_fuse(&attr);
+                reply.attr(&ttl, &fuse_attr);
             },
             Err(e) => {
                 reply.error(Errno::from_i32(errno(&e)));
