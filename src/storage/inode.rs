@@ -23,7 +23,7 @@ pub enum InodeType {
 pub const INODE_PAYLOAD: u64 = 3847;
 
 #[repr(C,align(4096))]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inode {
     _unused: u64,
     generation: u64,
@@ -164,6 +164,40 @@ impl Inode{
             },
             _ => { return false; }
         }
+    }
+
+    /* ---------------- attribute accessors (used by the FUSE layer) --------------- */
+
+    pub fn inode_type(&self) -> InodeType { self.i_type }
+    pub fn size_bytes(&self) -> u64 { self.size_bytes }
+    pub fn set_size_bytes(&mut self, size: u64) { self.size_bytes = size; }
+
+    pub fn uid(&self) -> u32 { self.uid }
+    pub fn gid(&self) -> u32 { self.gid }
+    pub fn set_owner(&mut self, uid: u32, gid: u32) { self.uid = uid; self.gid = gid; }
+
+    pub fn link_count(&self) -> u16 { self.link_count }
+    pub fn set_link_count(&mut self, count: u16) { self.link_count = count; }
+
+    /// Permission bits in POSIX octal form (e.g. 0o644). `mode` stores one
+    /// permission triple per hex nibble (0x0644), see `_check_write_permissions`.
+    pub fn perm(&self) -> u16 {
+        ((self.mode >> 8) & 0x7) << 6 | ((self.mode >> 4) & 0x7) << 3 | (self.mode & 0x7)
+    }
+
+    pub fn set_perm(&mut self, perm: u16) {
+        self.mode = ((perm >> 6) & 0x7) << 8 | ((perm >> 3) & 0x7) << 4 | (perm & 0x7);
+    }
+
+    pub fn atime(&self) -> (u64, u32) { (self.atime_sec, self.atime_nsec) }
+    pub fn mtime(&self) -> (u64, u32) { (self.mtime_sec, self.mtime_nsec) }
+    pub fn ctime(&self) -> (u64, u32) { (self.ctime_sec, self.ctime_nsec) }
+    pub fn set_atime(&mut self, (sec, nsec): (u64, u32)) { self.atime_sec = sec; self.atime_nsec = nsec; }
+    pub fn set_mtime(&mut self, (sec, nsec): (u64, u32)) { self.mtime_sec = sec; self.mtime_nsec = nsec; }
+    pub fn set_ctime(&mut self, (sec, nsec): (u64, u32)) { self.ctime_sec = sec; self.ctime_nsec = nsec; }
+
+    pub fn lookup(&mut self, path: &str) -> Result<()> {
+        Err(Error::other(""))
     }
     
     pub fn seek(&self, pos: u64, block_size: u64) -> Option<&Extent> {
