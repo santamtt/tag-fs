@@ -40,7 +40,8 @@ use std::collections::BTreeSet;
 use std::io::{
     Result,
     Error,
-    ErrorKind
+    ErrorKind,
+    SeekFrom
 };
 use std::sync::{ Mutex, MutexGuard };
 use std::time::{ Duration, SystemTime, UNIX_EPOCH };
@@ -405,6 +406,82 @@ impl<'a> Ctx<'a> {
 
     fn handle(&self, fh: u64) -> Result<OpenEntry> {
         self.open.elements.get(fh as usize).and_then(|e| *e)
+            .ok_or_else(|| Error::from_raw_os_error(libc::EBADF))
+    }
+
+    /// Every directory entry referencing `id`, as `(directory id, record)`:
+    /// at most one in the root (untagged file) plus one per tag.
+    fn entries_of(&mut self, id: u64) -> Result<Vec<(u64, DirRecord)>> {
+        let root_id = self.root_id;
+        let (_, root_records) = self.load_dir(root_id)?;
+
+        let mut found = Vec::new();
+        for r in root_records {
+            if r.id == id {
+                found.push((root_id, r));
+            } else if r.kind == FileKind::Directory {
+                let (_, children) = self.load_dir(r.id)?;
+                if let Some(child) = children.into_iter().find(|c| c.id == id) {
+                    found.push((r.id, child));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Object id of the tag called `tag` (tags live in the root).
+    fn tag_id(&mut self, tag: &str) -> Result<u64> {
+        let root_id = self.root_id;
+        let (_, records) = self.load_dir(root_id)?;
+        let idx = find(&records, tag)
+            .ok_or_else(|| err(ErrorKind::NotFound, format!("tag {:?} not found", tag)))?;
+        if records[idx].kind != FileKind::Directory {
+            return Err(err(ErrorKind::NotADirectory, format!("{:?} is not a tag", tag)));
+        }
+        Ok(records[idx].id)
+    }
+
+    /// Object id of the regular file behind handle `fh`, with its entries.
+    /// Fails with `NotFound` if the file was deleted while open.
+    fn handle_file(&mut self, fh: u64) -> Result<(u64, Vec<(u64, DirRecord)>)> {
+        let id = self.handle(fh)?.id as u64;
+        let entries = self.entries_of(id)?;
+        if entries.is_empty() {
+            return Err(err(ErrorKind::NotFound, "the file has been deleted"));
+        }
+        Ok((id, entries))
+    }
+
+    /// Adds `delta` to the link count of file `id`.
+    fn add_links(&mut self, id: u64, delta: i16) -> Result<()> {
+        let mut inode = self.load(id)?;
+        let links = inode.link_count().checked_add_signed(delta)
+            .ok_or_else(|| err(ErrorKind::TooManyLinks, "too many links"))?;
+        inode.set_link_count(links);
+        inode.set_ctime(now());
+        self.store(id, &inode)
+    }
+
+    /// Inserts `record` into directory `dir_id`; fails if the name is taken.
+    fn insert_entry(&mut self, dir_id: u64, record: DirRecord) -> Result<()> {
+        let (dir, mut records) = self.load_dir(dir_id)?;
+        if find(&records, &record.name).is_some() {
+            return Err(err(ErrorKind::AlreadyExists, format!("{:?} already exists", record.name)));
+        }
+        records.push(record);
+        self.store_dir(dir_id, dir, &records)
+    }
+
+    /// Removes the entry for file `id` from directory `dir_id`.
+    fn remove_entry(&mut self, dir_id: u64, id: u64) -> Result<()> {
+        let (dir, mut records) = self.load_dir(dir_id)?;
+        records.retain(|r| r.id != id);
+        self.store_dir(dir_id, dir, &records)
+    }
+
+    /// Mutable access to an open handle, used to move its cursor.
+    fn handle_mut(&mut self, fh: u64) -> Result<&mut OpenEntry> {
+        self.open.elements.get_mut(fh as usize).and_then(|e| e.as_mut())
             .ok_or_else(|| Error::from_raw_os_error(libc::EBADF))
     }
 }
@@ -790,26 +867,35 @@ impl TagFs {
         Ok(())
     }
 
-    pub fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+    /// Reads up to `size` bytes at the handle's cursor and advances it by the
+    /// number of bytes returned (empty at or past end of file).
+    pub fn read(&self, fh: u64, size: u32) -> Result<Vec<u8>> {
         let mut c = self.ctx()?;
         let entry = c.handle(fh)?;
         let inode = c.load(entry.id as u64)?;
 
         let len = inode.size_bytes();
-        let start = min(offset, len) as usize;
-        let end = min(offset.saturating_add(size as u64), len) as usize;
-        Ok(inode.payload[start..end].to_vec())
+        let start = min(entry.offset, len) as usize;
+        let end = min(entry.offset.saturating_add(size as u64), len) as usize;
+        let data = inode.payload[start..end].to_vec();
+
+        c.handle_mut(fh)?.offset += data.len() as u64;
+        Ok(data)
     }
 
-    /// Writes at `offset`; returns the number of bytes written (short when
-    /// the write crosses `MAX_FILE_SIZE`).
-    pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
+    /// Writes at the handle's cursor (at end of file for `O_APPEND` handles)
+    /// and advances it; returns the number of bytes written (short when the
+    /// write crosses `MAX_FILE_SIZE`).
+    pub fn write(&self, fh: u64, data: &[u8]) -> Result<u32> {
         let mut c = self.ctx()?;
         let entry = c.handle(fh)?;
         let id = entry.id as u64;
         let mut inode = c.load(id)?;
 
         if data.is_empty() { return Ok(0); }
+
+        let append = entry.flags as i32 & libc::O_APPEND != 0;
+        let offset = if append { inode.size_bytes() } else { entry.offset };
         if offset >= MAX_FILE_SIZE {
             return Err(err(ErrorKind::FileTooLarge, format!("files are limited to {} bytes", MAX_FILE_SIZE)));
         }
@@ -821,7 +907,94 @@ impl TagFs {
         touch(&mut inode);
 
         c.store(id, &inode)?;
+        c.handle_mut(fh)?.offset = offset + written as u64;
         Ok(written as u32)
+    }
+
+    /// Moves the handle's cursor like `lseek(2)` and returns the new position.
+    /// Seeking past end of file is allowed; a later write fills the gap with
+    /// zeros.
+    pub fn seek(&self, fh: u64, pos: SeekFrom) -> Result<u64> {
+        let mut c = self.ctx()?;
+        let entry = c.handle(fh)?;
+
+        let (base, delta) = match pos {
+            SeekFrom::Start(n) => (0, n as i128),
+            SeekFrom::Current(n) => (entry.offset, n as i128),
+            SeekFrom::End(n) => (c.load(entry.id as u64)?.size_bytes(), n as i128),
+        };
+        let target = base as i128 + delta;
+        if target < 0 || target > u64::MAX as i128 {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        c.handle_mut(fh)?.offset = target as u64;
+        Ok(target as u64)
+    }
+
+    /* ------------------------- tags through handles ------------------------ */
+
+    /// Names of the tags carried by the file open as `fh`, in root order.
+    pub fn tags(&self, fh: u64) -> Result<Vec<String>> {
+        let mut c = self.ctx()?;
+        let root_id = c.root_id;
+        let (_, entries) = c.handle_file(fh)?;
+        let (_, root_records) = c.load_dir(root_id)?;
+
+        let tag_ids: Vec<u64> = entries.iter().map(|(dir, _)| *dir).filter(|d| *d != root_id).collect();
+        Ok(root_records.into_iter()
+            .filter(|r| r.kind == FileKind::Directory && tag_ids.contains(&r.id))
+            .map(|r| r.name)
+            .collect())
+    }
+
+    /// Adds tag `tag` to the file open as `fh`. The file keeps its current
+    /// name inside the tag; an untagged file leaves the root.
+    pub fn add_tag(&self, fh: u64, tag: &str) -> Result<()> {
+        let mut c = self.ctx()?;
+        let root_id = c.root_id;
+        let (id, entries) = c.handle_file(fh)?;
+        let tag_id = c.tag_id(tag)?;
+
+        if entries.iter().any(|(dir, _)| *dir == tag_id) {
+            return Err(err(ErrorKind::AlreadyExists, format!("the file already has tag {:?}", tag)));
+        }
+        let record = entries[0].1.clone();
+        let in_root = entries.iter().any(|(dir, _)| *dir == root_id);
+
+        // Link count first, then the new entry, then the old root entry: after
+        // a crash the file is in too many places rather than in none.
+        c.add_links(id, 1)?;
+        if let Err(e) = c.insert_entry(tag_id, record) {
+            let _ = c.add_links(id, -1);
+            return Err(e);
+        }
+        if in_root {
+            c.remove_entry(root_id, id)?;
+            c.add_links(id, -1)?;
+        }
+        Ok(())
+    }
+
+    /// Removes tag `tag` from the file open as `fh`. A file losing its last
+    /// tag goes back to the root (it is not deleted).
+    pub fn remove_tag(&self, fh: u64, tag: &str) -> Result<()> {
+        let mut c = self.ctx()?;
+        let root_id = c.root_id;
+        let (id, entries) = c.handle_file(fh)?;
+        let tag_id = c.tag_id(tag)?;
+
+        let (_, record) = entries.iter().find(|(dir, _)| *dir == tag_id).cloned()
+            .ok_or_else(|| err(ErrorKind::NotFound, format!("the file does not have tag {:?}", tag)))?;
+
+        if entries.len() == 1 {
+            // Last tag: move the file back to the root, root entry first.
+            c.insert_entry(root_id, record)?;
+            c.remove_entry(tag_id, id)
+        } else {
+            c.remove_entry(tag_id, id)?;
+            c.add_links(id, -1)
+        }
     }
 
     /* -------------------------- legacy interface --------------------------- */
@@ -843,22 +1016,20 @@ impl TagFs {
     pub fn close_file(&self, fd: usize) -> Result<()> { self.release(fd as u64) }
 
     pub fn read_file(&self, fd: usize, read_size: usize) -> Result<Vec<u8>> {
-        let offset = self.ctx()?.handle(fd as u64)?.offset;
-        let data = self.read(fd as u64, offset, read_size.min(u32::MAX as usize) as u32)?;
-
-        let mut c = self.ctx()?;
-        if let Some(Some(entry)) = c.open.elements.get_mut(fd) { entry.offset += data.len() as u64; }
-        Ok(data)
+        self.read(fd as u64, read_size.min(u32::MAX as usize) as u32)
     }
 
     pub fn write_file(&self, fd: usize, bytes_in: Vec<u8>) -> Result<()> {
-        let offset = self.ctx()?.handle(fd as u64)?.offset;
-        let written = self.write(fd as u64, offset, &bytes_in)?;
-
-        let mut c = self.ctx()?;
-        if let Some(Some(entry)) = c.open.elements.get_mut(fd) { entry.offset += written as u64; }
-        Ok(())
+        self.write(fd as u64, &bytes_in).map(|_| ())
     }
+
+    pub fn seek_file(&self, fd: usize, pos: SeekFrom) -> Result<u64> { self.seek(fd as u64, pos) }
+
+    pub fn file_tags(&self, fd: usize) -> Result<Vec<String>> { self.tags(fd as u64) }
+
+    pub fn tag_file(&self, fd: usize, tag_name: &str) -> Result<()> { self.add_tag(fd as u64, tag_name) }
+
+    pub fn untag_file(&self, fd: usize, tag_name: &str) -> Result<()> { self.remove_tag(fd as u64, tag_name) }
 }
 
 #[cfg(test)]
@@ -920,10 +1091,13 @@ mod tests {
 
         let (file, fh) = fs.create(tag.ino, "tom.txt", 0o640, libc::O_RDWR, 1000, 1000).unwrap();
         assert_eq!(file.perm, 0o640);
-        assert_eq!(fs.write(fh, 0, b"hello world").unwrap(), 11);
-        assert_eq!(fs.write(fh, 6, b"tagfs").unwrap(), 5);
-        assert_eq!(fs.read(fh, 0, 100).unwrap(), b"hello tagfs");
-        assert_eq!(fs.read(fh, 6, 3).unwrap(), b"tag");
+        assert_eq!(fs.write(fh, b"hello world").unwrap(), 11);
+        fs.seek(fh, SeekFrom::Start(6)).unwrap();
+        assert_eq!(fs.write(fh, b"tagfs").unwrap(), 5);
+        fs.seek(fh, SeekFrom::Start(0)).unwrap();
+        assert_eq!(fs.read(fh, 100).unwrap(), b"hello tagfs");
+        fs.seek(fh, SeekFrom::Start(6)).unwrap();
+        assert_eq!(fs.read(fh, 3).unwrap(), b"tag");
         fs.release(fh).unwrap();
 
         assert_eq!(fs.lookup(tag.ino, "tom.txt").unwrap().size, 11);
@@ -986,10 +1160,11 @@ mod tests {
     fn unlinked_open_file_survives_until_release() {
         let (_img, fs) = fresh();
         let (file, fh) = fs.create(ROOT_INO, "tmp", 0o644, 0, 0, 0).unwrap();
-        fs.write(fh, 0, b"data").unwrap();
+        fs.write(fh, b"data").unwrap();
 
         fs.unlink(ROOT_INO, "tmp").unwrap();
-        assert_eq!(fs.read(fh, 0, 10).unwrap(), b"data");
+        fs.seek(fh, SeekFrom::Start(0)).unwrap();
+        assert_eq!(fs.read(fh, 10).unwrap(), b"data");
         fs.release(fh).unwrap();
         assert!(fs.getattr(file.ino).is_err());
     }
@@ -998,18 +1173,21 @@ mod tests {
     fn setattr_truncate_and_limits() {
         let (_img, fs) = fresh();
         let (file, fh) = fs.create(ROOT_INO, "f", 0o644, 0, 0, 0).unwrap();
-        fs.write(fh, 0, b"0123456789").unwrap();
+        fs.write(fh, b"0123456789").unwrap();
 
         let st = fs.setattr(file.ino, &SetAttr { size: Some(4), mode: Some(0o600), ..Default::default() }).unwrap();
         assert_eq!((st.size, st.perm), (4, 0o600));
         // Extending again reads zeros, not the old bytes.
         fs.setattr(file.ino, &SetAttr { size: Some(8), ..Default::default() }).unwrap();
-        assert_eq!(fs.read(fh, 0, 100).unwrap(), b"0123\0\0\0\0");
+        fs.seek(fh, SeekFrom::Start(0)).unwrap();
+        assert_eq!(fs.read(fh, 100).unwrap(), b"0123\0\0\0\0");
 
-        assert_eq!(fs.write(fh, MAX_FILE_SIZE - 2, b"abcd").unwrap(), 2);
-        assert_eq!(fs.write(fh, MAX_FILE_SIZE, b"x").unwrap_err().kind(), ErrorKind::FileTooLarge);
-        assert_eq!(errno(&fs.write(fh, MAX_FILE_SIZE, b"x").unwrap_err()), libc::EFBIG);
-        assert_eq!(errno(&fs.read(999, 0, 1).unwrap_err()), libc::EBADF);
+        fs.seek(fh, SeekFrom::Start(MAX_FILE_SIZE - 2)).unwrap();
+        assert_eq!(fs.write(fh, b"abcd").unwrap(), 2);
+        // The cursor is now at MAX_FILE_SIZE: no more room.
+        assert_eq!(fs.write(fh, b"x").unwrap_err().kind(), ErrorKind::FileTooLarge);
+        assert_eq!(errno(&fs.write(fh, b"x").unwrap_err()), libc::EFBIG);
+        assert_eq!(errno(&fs.read(999, 1).unwrap_err()), libc::EBADF);
         fs.release(fh).unwrap();
     }
 
@@ -1018,7 +1196,7 @@ mod tests {
         let (img, fs) = fresh();
         let tag = fs.mkdir(ROOT_INO, "train", 0o755, 0, 0).unwrap();
         let (file, fh) = fs.create(tag.ino, "sample.bin", 0o644, 0, 0, 0).unwrap();
-        fs.write(fh, 0, b"payload").unwrap();
+        fs.write(fh, b"payload").unwrap();
         fs.release(fh).unwrap();
         fs.unmount().unwrap();
         drop(fs);
@@ -1027,8 +1205,101 @@ mod tests {
         let st = fs.disk_lookup("train/sample.bin").unwrap();
         assert_eq!((st.ino, st.size), (file.ino, 7));
         let fh = fs.open(st.ino, libc::O_RDONLY).unwrap();
-        assert_eq!(fs.read(fh, 0, 100).unwrap(), b"payload");
+        assert_eq!(fs.read(fh, 100).unwrap(), b"payload");
         assert!(fs.statfs().unwrap().bfree > 0);
+    }
+
+    #[test]
+    fn cursor_and_seek() {
+        let (_img, fs) = fresh();
+        let (file, fh) = fs.create(ROOT_INO, "f", 0o644, libc::O_RDWR, 0, 0).unwrap();
+
+        // Sequential writes and reads advance the cursor.
+        fs.write(fh, b"abc").unwrap();
+        fs.write(fh, b"def").unwrap();
+        assert_eq!(fs.seek(fh, SeekFrom::Current(0)).unwrap(), 6);
+        assert_eq!(fs.seek(fh, SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(fs.read(fh, 2).unwrap(), b"ab");
+        assert_eq!(fs.read(fh, 2).unwrap(), b"cd");
+        assert_eq!(fs.read(fh, 100).unwrap(), b"ef");
+        assert_eq!(fs.read(fh, 100).unwrap(), b""); // EOF
+
+        // Relative seeks.
+        assert_eq!(fs.seek(fh, SeekFrom::End(-1)).unwrap(), 5);
+        assert_eq!(fs.read(fh, 10).unwrap(), b"f");
+        assert_eq!(fs.seek(fh, SeekFrom::Current(-4)).unwrap(), 2);
+        assert_eq!(errno(&fs.seek(fh, SeekFrom::Current(-10)).unwrap_err()), libc::EINVAL);
+
+        // Seeking past EOF and writing leaves a zero-filled hole.
+        fs.seek(fh, SeekFrom::End(2)).unwrap();
+        fs.write(fh, b"z").unwrap();
+        fs.seek(fh, SeekFrom::Start(0)).unwrap();
+        assert_eq!(fs.read(fh, 100).unwrap(), b"abcdef\0\0z");
+
+        // Each handle has its own cursor.
+        let fh2 = fs.open(file.ino, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read(fh2, 3).unwrap(), b"abc");
+        assert_eq!(fs.seek(fh, SeekFrom::Current(0)).unwrap(), 9);
+
+        // O_APPEND always writes at end of file, wherever the cursor is.
+        let fh3 = fs.open(file.ino, libc::O_WRONLY | libc::O_APPEND).unwrap();
+        fs.seek(fh3, SeekFrom::Start(0)).unwrap();
+        fs.write(fh3, b"!").unwrap();
+        assert_eq!(fs.seek(fh3, SeekFrom::Current(0)).unwrap(), 10);
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 10);
+
+        for h in [fh, fh2, fh3] { fs.release(h).unwrap(); }
+    }
+
+    #[test]
+    fn tags_through_handle() {
+        let (_img, fs) = fresh();
+        let cats = fs.mkdir(ROOT_INO, "cats", 0o755, 0, 0).unwrap();
+        let pets = fs.mkdir(ROOT_INO, "pets", 0o755, 0, 0).unwrap();
+        let (file, fh) = fs.create(ROOT_INO, "tom", 0o644, libc::O_RDWR, 0, 0).unwrap();
+        fs.write(fh, b"meow").unwrap();
+        assert!(fs.tags(fh).unwrap().is_empty());
+
+        // Tagging an untagged file moves it out of the root.
+        fs.add_tag(fh, "cats").unwrap();
+        assert_eq!(fs.tags(fh).unwrap(), vec!["cats"]);
+        assert!(fs.lookup(ROOT_INO, "tom").is_err());
+        assert_eq!(fs.lookup(cats.ino, "tom").unwrap().ino, file.ino);
+        assert_eq!(fs.getattr(file.ino).unwrap().nlink, 1);
+
+        fs.add_tag(fh, "pets").unwrap();
+        assert_eq!(fs.tags(fh).unwrap(), vec!["cats", "pets"]);
+        assert_eq!(fs.getattr(file.ino).unwrap().nlink, 2);
+        assert_eq!(fs.add_tag(fh, "pets").unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs.add_tag(fh, "dogs").unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(fs.add_tag(fh, "tom").unwrap_err().kind(), ErrorKind::NotFound); // not in root anymore
+
+        // Removing tags; the last one sends the file back to the root.
+        fs.remove_tag(fh, "cats").unwrap();
+        assert_eq!(fs.tags(fh).unwrap(), vec!["pets"]);
+        assert_eq!(fs.remove_tag(fh, "cats").unwrap_err().kind(), ErrorKind::NotFound);
+        fs.remove_tag(fh, "pets").unwrap();
+        assert!(fs.tags(fh).unwrap().is_empty());
+        assert_eq!(fs.lookup(ROOT_INO, "tom").unwrap().ino, file.ino);
+        assert_eq!(fs.getattr(file.ino).unwrap().nlink, 1);
+        assert!(names(&fs, pets.ino).len() == 2); // only "." and ".."
+
+        // Data and cursor are untouched by tag changes.
+        fs.seek(fh, SeekFrom::Start(0)).unwrap();
+        assert_eq!(fs.read(fh, 10).unwrap(), b"meow");
+
+        // Name clash inside the tag.
+        let (_, other) = fs.create(cats.ino, "tom", 0o644, 0, 0, 0).unwrap();
+        assert_eq!(fs.add_tag(fh, "cats").unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs.lookup(ROOT_INO, "tom").unwrap().ino, file.ino); // unchanged
+        assert_eq!(fs.getattr(file.ino).unwrap().nlink, 1);
+        fs.release(other).unwrap();
+
+        // Deleted while open.
+        fs.unlink(ROOT_INO, "tom").unwrap();
+        assert_eq!(fs.tags(fh).unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(errno(&fs.tags(999).unwrap_err()), libc::EBADF);
+        fs.release(fh).unwrap();
     }
 
     #[test]
@@ -1039,6 +1310,12 @@ mod tests {
         fs.release(fh).unwrap();
 
         let fd = fs.open_file(file.ino as u128).unwrap();
+        fs.tag_file(fd, "prova").unwrap();
+        assert_eq!(fs.file_tags(fd).unwrap(), vec!["prova"]);
+        fs.untag_file(fd, "prova").unwrap();
+        fs.close_file(fd).unwrap();
+
+        let fd = fs.open_file(file.ino as u128).unwrap();
         fs.write_file(fd, b"Hello ".to_vec()).unwrap();
         fs.write_file(fd, b"World".to_vec()).unwrap();
         fs.close_file(fd).unwrap();
@@ -1046,6 +1323,8 @@ mod tests {
         let fd = fs.open_file(file.ino as u128).unwrap();
         assert_eq!(fs.read_file(fd, 5).unwrap(), b"Hello");
         assert_eq!(fs.read_file(fd, 100).unwrap(), b" World");
+        assert_eq!(fs.seek_file(fd, SeekFrom::Start(6)).unwrap(), 6);
+        assert_eq!(fs.read_file(fd, 100).unwrap(), b"World");
         fs.close_file(fd).unwrap();
     }
 }

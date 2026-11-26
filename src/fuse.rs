@@ -5,10 +5,10 @@ use crate::storage::errno;
 use core::time::Duration;
 use std::time::SystemTime;
 
-use fuser::{Filesystem, TimeOrNow};
+use fuser::{Filesystem, FopenFlags, TimeOrNow};
 use fuser::{ FileAttr, FileType, FileHandle };
 use fuser::{ Request, INodeNo, Errno, Generation};
-use fuser::{ ReplyAttr, ReplyEntry, ReplyDirectory };
+use fuser::{ ReplyAttr, ReplyEntry, ReplyDirectory, ReplyCreate };
 
 use std::ffi::{ OsStr };
 
@@ -91,14 +91,14 @@ impl Filesystem for TagFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<FileHandle>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<fuser::BsdFileFlags>,
+        _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         let ino_attr: SetAttr =  SetAttr {
@@ -106,8 +106,8 @@ impl Filesystem for TagFs {
             uid: uid,
             gid: gid,
             size: size,
-            atime: convert_timestamp(&_atime),
-            mtime: convert_timestamp(&_mtime),
+            atime: convert_timestamp(&atime),
+            mtime: convert_timestamp(&mtime),
         };
 
         match self.setattr(ino.0, &ino_attr) {
@@ -132,6 +132,16 @@ impl Filesystem for TagFs {
             Err(e) => {
                 reply.error(Errno::from_i32(errno(&e)));
             }
+        }
+    }
+
+// directories methods
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        match self.getattr(ino.0) {
+            Ok(st) if st.kind == FileKind::Directory => reply.opened(FileHandle(0), FopenFlags::empty()),
+            Ok(_) => reply.error(Errno::from_i32(libc::ENOTDIR)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
@@ -166,6 +176,124 @@ impl Filesystem for TagFs {
                         break; // reply buffer full; kernel will call again with this offset
                     }
                 }
+                reply.ok();
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, _reply: fuser::ReplyEmpty) {
+        todo!();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: fuser::ReplyEmpty,
+    )
+    {
+        reply.ok();
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        match self.open(ino.0, flags.0) {
+            Ok(fd) => {
+                let fuse_fd = FileHandle(fd);
+                reply.opened(fuse_fd, FopenFlags::empty());
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
+    }
+
+    fn create(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    )
+    {
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        match self.create(parent.0, name_str, mode | !umask, flags, req.uid(), req.gid()) {
+            Ok((attr,fd)) => {
+                let ttl = Duration::from_secs(1);
+                reply.created(&ttl, &get_attr_fuse(&attr), Generation(0), FileHandle(fd), FopenFlags::empty());
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: u64,
+        _size: u32,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _reply: fuser::ReplyData,
+    )
+    {
+        todo!();
+    }
+
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    )
+    {
+        match self.write(fh.0, data) {
+            Ok(written) => {
+                reply.written(written);
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    )
+    {
+        match self.release(fh.0) {
+            Ok(()) => {
                 reply.ok();
             },
             Err(e) => {
