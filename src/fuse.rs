@@ -246,15 +246,22 @@ impl Filesystem for TagFs {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _offset: u64,
-        _size: u32,
+        size: u32,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
-        _reply: fuser::ReplyData,
+        reply: fuser::ReplyData,
     )
     {
-        todo!();
+        match self.read(fh.0, size) {
+            Ok(data) => {
+                reply.data(data.as_slice());
+            },
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+            }
+        }
     }
 
 
